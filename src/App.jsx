@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import QRCode from "qrcode";
 import {
   AppleLogo,
   ArrowLeft,
@@ -30,7 +31,7 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { ALL_ATTRACTIONS_BY_ID, RESTAURANTS, TOILETS, VERIFIED_AT } from "./extendedData.js";
+import { ALL_ATTRACTIONS, ALL_ATTRACTIONS_BY_ID, RESTAURANTS, TOILETS, VERIFIED_AT } from "./extendedData.js";
 import { detailsForAttraction } from "./details.js";
 import { createWalkingMapLinks } from "./mapNavigation.js";
 import {
@@ -81,10 +82,13 @@ import { loadAntistormNowcast, loadWeather, formatPolishDay } from "./weather.js
 import { assessThreeDayWeather } from "./weatherPlan.js";
 import { RainSafetyCard, WeatherStart } from "./WeatherStart.jsx";
 import { EntryStart } from "./EntryStart.jsx";
+import { directionsForDay } from "./planDirections.js";
+import { replacementOptionsForPlan, replacementTargetForPlan, replacePlannedAttraction } from "./replacements.js";
 
 const DRAFT_KEY = "energylandia-planner-v1:draft";
 const PLAN_KEY = "energylandia-planner-v1:plan";
 const COMPLETED_KEY = "energylandia-planner-v1:completed";
+const REJECTED_KEY = "energylandia-planner-v1:rejected";
 
 const STEP_LABELS = ["CZAS", "SKŁAD", "WZROST", "APETYT", "PODZIAŁ", "OBIAD", "PODSUMOWANIE"];
 const STEP_ILLUSTRATIONS = [
@@ -226,6 +230,10 @@ function completedNamespaceFor(plan) {
   const day = plan?.profile?.visitStartDate || warsawDateKey(Number.isFinite(generated.getTime()) ? generated : new Date());
   const party = (plan?.profile?.members || []).map((member) => `${member.role}-${member.age}-${member.height}`).join("_");
   return `${COMPLETED_KEY}:${day}:${party}`.slice(0, 240);
+}
+
+function rejectedNamespaceFor(plan) {
+  return completedNamespaceFor(plan).replace(COMPLETED_KEY, REJECTED_KEY);
 }
 
 function safeSanitizePlan(value) {
@@ -748,6 +756,39 @@ function DetailSheet({ attraction, sequence, memberIds, members, onClose }) {
   );
 }
 
+function ReplacementSheet({ plan, request, queueById, rejectedIds, onReplace, onClose }) {
+  const closeRef = useRef(null);
+  const target = replacementTargetForPlan(plan, request);
+  const options = useMemo(() => replacementOptionsForPlan(plan, request, { queueById, rejectedIds }), [plan, queueById, rejectedIds, request]);
+
+  useLayoutEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  if (!target) return null;
+  const riders = plan.profile.members.filter((member) => target.memberIds.includes(member.id)).map(memberLabel).join(" · ");
+  return (
+    <div className="sheet-layer">
+      <div className="sheet-backdrop" onClick={onClose} aria-hidden="true" />
+      <section className="detail-sheet replacement-sheet" role="dialog" aria-modal="true" aria-labelledby="replacement-title">
+        <div className="sheet-handle" />
+        <header><div><p className="eyebrow">TEN SAM BEZPIECZNY SLOT</p><h2 id="replacement-title">Wymień {target.attraction.name}</h2></div><button ref={closeRef} className="icon-button" type="button" onClick={onClose} aria-label="Zamknij"><X size={22} weight="bold" /></button></header>
+        <p className="replacement-intro">Gdy komuś nie podoba się motyw albo wygląd atrakcji, wybierzcie inną. Zmieniam tylko ten punkt — skład <strong>{riders}</strong>, obiad, bufory i godzina końca zostają bez zmian.</p>
+        {options.length > 0 ? <div className="replacement-options">{options.map(({ attraction, queue, reason }) => <article key={attraction.id}><span className="replacement-mark"><ArrowClockwise size={20} weight="bold" /></span><div><em>{zoneLabel(attraction.zone)}</em><h3>{attraction.name}</h3><p>{attractionLabel(attraction)}</p><small>{reason}{Number.isFinite(queue?.waitTime) ? ` · kolejka ${queue.waitTime} min` : ""}</small></div><button type="button" onClick={() => onReplace(attraction.id)}>Wybierz</button></article>)}</div> : <div className="replacement-empty"><WarningCircle size={24} weight="duotone" /><span><strong>Nie ma teraz uczciwego zamiennika blisko trasy.</strong><small>Nie proponujemy atrakcji ponad ograniczenia grupy ani takiej, która rozbije posiłek lub godzinę końca. Możesz wrócić i przeliczyć cały plan.</small></span></div>}
+        <p className="sheet-note">Odrzucona atrakcja nie wróci przy następnym przeliczeniu tego planu. Ostateczną decyzję o wejściu zawsze podejmuje obsługa.</p>
+      </section>
+    </div>
+  );
+}
+
 function annotatedDay(day) {
   let sequence = 0;
   return {
@@ -776,7 +817,79 @@ function planMapItems(day) {
   });
 }
 
-const PRINT_DAY_ART = ["07-podsumowanie.jpg", "04-apetyt.jpg", "01-czas.jpg"];
+function NavigationQr({ value, label }) {
+  const qr = useMemo(() => QRCode.create(value, { errorCorrectionLevel: "M" }), [value]);
+  const margin = 2;
+  const size = qr.modules.size;
+  let path = "";
+  for (let row = 0; row < size; row += 1) {
+    for (let column = 0; column < size; column += 1) {
+      if (qr.modules.data[row * size + column]) path += `M${column + margin} ${row + margin}h1v1h-1z`;
+    }
+  }
+  return <svg className="navigation-qr" viewBox={`0 0 ${size + margin * 2} ${size + margin * 2}`} role="img" aria-label={label}><rect width="100%" height="100%" fill="#fff8f0" /><path d={path} fill="#424023" /></svg>;
+}
+
+function walkingQrUrl(destination) {
+  const lat = destination?.location?.lat ?? destination?.lat;
+  const lon = destination?.location?.lon ?? destination?.lon;
+  return `https://maps.google.com/?daddr=${lat},${lon}&dirflg=w`;
+}
+
+function printableMapItems(day) {
+  return day.steps.flatMap((step) => {
+    if (step.kind === "ride") {
+      const ride = ALL_ATTRACTIONS_BY_ID[step.attractionId];
+      return ride ? [{ ...ride, marker: String(step.sequence), kind: "ride" }] : [];
+    }
+    if (step.kind === "split") {
+      return (step.assignments || []).flatMap((assignment, index) => {
+        const ride = ALL_ATTRACTIONS_BY_ID[assignment.attractionId];
+        return ride ? [{ ...ride, marker: `${step.sequence}${index === 0 ? "A" : "B"}`, kind: "split" }] : [];
+      });
+    }
+    if (step.kind === "meal") {
+      const restaurant = RESTAURANTS.find((candidate) => candidate.id === step.restaurantId);
+      return restaurant ? [{ ...restaurant, marker: "O", kind: "meal" }] : [];
+    }
+    return [];
+  });
+}
+
+function PrintableDayMap({ day, attractionCount }) {
+  const items = printableMapItems(day);
+  if (items.length < 2) return <figure className="pdf-day-hero"><img src={`${import.meta.env.BASE_URL}assets/onboarding/07-podsumowanie.jpg`} alt="Filcowa mapa dnia" /><figcaption><span><strong>{attractionCount}</strong> atrakcji</span><span><strong>~{day.stats.walkingMinutes}</strong> min marszu</span><span><strong>{day.stats.start}–{day.stats.end}</strong> pełny dzień</span></figcaption></figure>;
+  const width = 650;
+  const height = 255;
+  const padding = 42;
+  const lats = items.map((item) => item.location?.lat ?? item.lat);
+  const lons = items.map((item) => item.location?.lon ?? item.lon);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const project = (item) => {
+    const lat = item.location?.lat ?? item.lat;
+    const lon = item.location?.lon ?? item.lon;
+    const x = padding + ((lon - minLon) / Math.max(maxLon - minLon, 0.00001)) * (width - padding * 2);
+    const captionReserve = 58;
+    const y = height - padding - captionReserve - ((lat - minLat) / Math.max(maxLat - minLat, 0.00001)) * (height - padding * 2 - captionReserve);
+    return [Number(x.toFixed(1)), Number(y.toFixed(1))];
+  };
+  const points = items.map(project);
+  return (
+    <figure className="pdf-route-map">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Schemat kolejności punktów planu">
+        <defs><filter id={`route-shadow-${day.day}`} x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".18" /></filter></defs>
+        <path className="pdf-map-contour one" d="M4 72C88 18 179 48 238 15s168 15 213 2 147 8 195 63v154H4Z" />
+        <path className="pdf-map-contour two" d="M0 187c105-42 159 29 260-4s170-1 223 23 116-2 167-36v85H0Z" />
+        <polyline className="pdf-map-route" points={points.map((point) => point.join(",")).join(" ")} />
+        {items.map((item, index) => { const [x, y] = points[index]; return <g className={`pdf-map-marker ${item.kind}`} key={`${item.id}-${index}`} transform={`translate(${x} ${y})`} filter={`url(#route-shadow-${day.day})`}><circle r="18" /><text y="1">{item.marker}</text></g>; })}
+      </svg>
+      <figcaption><span><strong>{attractionCount}</strong> atrakcji</span><span><strong>~{day.stats.walkingMinutes}</strong> min marszu</span><span><strong>{day.stats.start}–{day.stats.end}</strong> pełny dzień</span><small>Schemat kolejności; alejki w parku mogą prowadzić inaczej. O = obiad.</small></figcaption>
+    </figure>
+  );
+}
 
 function PrintablePlan({ plan, planUrl, preview = false }) {
   if (!plan) return null;
@@ -821,17 +934,18 @@ function PrintablePlan({ plan, planUrl, preview = false }) {
         const day = annotatedDay(rawDay);
         const dateLabel = planDayDateLabel(plan, dayIndex, false);
         const attractionCount = day.steps.reduce((count, step) => count + (step.kind === "ride" ? 1 : step.kind === "split" ? step.assignments.length : 0), 0);
+        const directions = directionsForDay(day);
         return <section className="pdf-page pdf-day-page" key={day.day}>
           <header className="pdf-brandline"><span className="pdf-brand compact"><img src={`${import.meta.env.BASE_URL}icon-192-v3.png`} alt="" /><span><strong>PogodaPark</strong><small>PLAN DLA WAS</small></span></span><span className="pdf-edition">DZIEŃ {day.day ?? dayIndex + 1} Z {plan.days.length}</span></header>
           <div className="pdf-day-heading"><div><p>{dateLabel || `Dzień ${dayIndex + 1}`}</p><h2>{day.label || `Dzień ${dayIndex + 1}`}</h2></div><strong>{day.stats.start}<i>–</i>{day.stats.end}</strong></div>
-          <figure className="pdf-day-hero"><img src={`${import.meta.env.BASE_URL}assets/onboarding/${PRINT_DAY_ART[dayIndex % PRINT_DAY_ART.length]}`} alt="Filcowa mapa dnia" /><figcaption><span><strong>{attractionCount}</strong> atrakcji</span><span><strong>~{day.stats.walkingMinutes}</strong> min marszu</span><span><strong>{day.stats.start}–{day.stats.end}</strong> pełny dzień</span></figcaption></figure>
+          <PrintableDayMap day={day} attractionCount={attractionCount} />
           <div className="pdf-timeline">
             {day.steps.map((step) => {
-              if (step.kind === "meal") return <div className="pdf-step meal" key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/06-obiad.jpg`} alt="" /><strong>{formatPlanTime(step.startMin)}<small>OBIAD</small></strong><span><b>{step.title}</b><small>{step.description}</small></span></div>;
-              if (step.kind === "show") return <div className="pdf-step show" key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/04-apetyt.jpg`} alt="" /><strong>{formatPlanTime(step.performanceStartMin)}<small>POKAZ • {step.durationMinutes} MIN</small></strong><span><b>{step.title}</b><small>{step.venue} · {step.description}</small></span></div>;
+              if (step.kind === "meal") { const restaurant = RESTAURANTS.find((candidate) => candidate.id === step.restaurantId); const links = restaurant ? createWalkingMapLinks(restaurant) : null; return <div className={`pdf-step meal ${links ? "has-qr" : ""}`} key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/06-obiad.jpg`} alt="" /><strong>{formatPlanTime(step.startMin)}<small>OBIAD</small></strong><span><b>{step.title}</b><small>{step.description}</small>{directions[step.id] && <small className="pdf-direction">{directions[step.id].copy}</small>}</span>{links && <NavigationQr value={walkingQrUrl(restaurant)} label={`Kod QR prowadzący do ${restaurant.name}`} />}</div>; }
+              if (step.kind === "show") return <div className={`pdf-step show ${step.mapUrl ? "has-qr" : ""}`} key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/04-apetyt.jpg`} alt="" /><strong>{formatPlanTime(step.performanceStartMin)}<small>POKAZ • {step.durationMinutes} MIN</small></strong><span><b>{step.title}</b><small>{step.venue} · {step.description}</small></span>{step.mapUrl && <NavigationQr value={step.mapUrl} label={`Kod QR do mapy: ${step.title}`} />}</div>;
               if (step.kind === "flex") return <div className="pdf-step flex" key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/01-czas.jpg`} alt="" /><strong>{formatPlanTime(step.startMin)}<small>DO {formatPlanTime(step.unplannedUntil ?? step.endMin)}</small></strong><span><b>{step.title}</b><small>{step.description}</small></span></div>;
-              if (step.kind === "ride") { const ride = ALL_ATTRACTIONS_BY_ID[step.attractionId]; return <div className="pdf-step ride" key={step.id}><i>{step.sequence}</i><strong>{formatPlanTime(step.startMin)}<small>WSZYSCY</small></strong><span><b>{ride.name}</b><small>{zoneLabel(ride.zone)} · {attractionLabel(ride)}</small></span></div>; }
-              return <div className="pdf-step split" key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/05-podzial.jpg`} alt="" /><strong>{formatPlanTime(step.startMin)}<small>PODZIAŁ {step.sequence}</small></strong><span>{step.assignments.map((assignment) => { const ride = ALL_ATTRACTIONS_BY_ID[assignment.attractionId]; return <b key={assignment.attractionId}>{assignment.label}: {ride.name}<small>{assignment.memberIds.map((id) => memberLabel(plan.profile.members.find((member) => member.id === id))).join(", ")}</small></b>; })}<em>Spotkanie {step.reunion.time}: {step.reunion.label}</em></span></div>;
+              if (step.kind === "ride") { const ride = ALL_ATTRACTIONS_BY_ID[step.attractionId]; return <div className="pdf-step ride has-qr" key={step.id}><i>{step.sequence}</i><strong>{formatPlanTime(step.startMin)}<small>WSZYSCY</small></strong><span><b>{ride.name}</b><small>{zoneLabel(ride.zone)} · {attractionLabel(ride)}</small>{directions[step.id] && <small className="pdf-direction">{directions[step.id].copy}</small>}</span><NavigationQr value={walkingQrUrl(ride)} label={`Kod QR prowadzący do ${ride.name}`} /></div>; }
+              return <div className="pdf-step split" key={step.id}><img src={`${import.meta.env.BASE_URL}assets/onboarding/05-podzial.jpg`} alt="" /><strong>{formatPlanTime(step.startMin)}<small>PODZIAŁ {step.sequence}</small></strong><span className="pdf-split-list">{step.assignments.map((assignment, index) => { const ride = ALL_ATTRACTIONS_BY_ID[assignment.attractionId]; return <b key={assignment.attractionId}><span>{assignment.label}: {ride.name}<small>{assignment.memberIds.map((id) => memberLabel(plan.profile.members.find((member) => member.id === id))).join(", ")}</small><small className="pdf-direction">{directions[`${step.id}:${index}`]?.copy}</small></span><NavigationQr value={walkingQrUrl(ride)} label={`Kod QR prowadzący do ${ride.name}`} /></b>; })}<em>Spotkanie {step.reunion.time}: {step.reunion.label}</em></span></div>;
             })}
           </div>
           <aside className="pdf-day-reminder"><strong>Bufor jest częścią planu.</strong><span>Jeśli atrakcje pójdą szybciej, wykorzystajcie wolny czas na WC, odpoczynek albo jedną z propozycji zapasowych — nie skracajcie dnia w ciemno.</span></aside>
@@ -961,21 +1075,27 @@ function SharedPlanStatus({ status, error, onRetry, onStart }) {
   );
 }
 
-function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weatherAssessment, weatherStatus, onRefreshWeather, showSchedule, showStatus, onRefreshShows, onToggleShows }) {
+function PlanView({ plan, queues, initialShortPlanUrl = "", onEdit, onReanalyze, onReplaceAttraction, weatherAssessment, weatherStatus, onRefreshWeather, showSchedule, showStatus, onRefreshShows, onToggleShows }) {
   const planHeadingRef = useRef(null);
   const [selectedDay, setSelectedDay] = useState(0);
   const [selectedId, setSelectedId] = useState(null);
   const [showToilets, setShowToilets] = useState(false);
   const { position, status: locationStatus, locate } = useUserLocation();
   const completedKey = useMemo(() => completedNamespaceFor(plan), [plan]);
+  const rejectedKey = useMemo(() => rejectedNamespaceFor(plan), [plan]);
   const [completedIds, setCompletedIds] = useState(() => {
     const stored = readStored(completedKey, []);
     return Array.isArray(stored) ? [...new Set(stored.filter((id) => ALL_ATTRACTIONS_BY_ID[id]))] : [];
   });
+  const [rejectedIds, setRejectedIds] = useState(() => {
+    const stored = readStored(rejectedKey, []);
+    return Array.isArray(stored) ? [...new Set(stored.filter((id) => ALL_ATTRACTIONS_BY_ID[id]))] : [];
+  });
+  const [replacementRequest, setReplacementRequest] = useState(null);
   const [email, setEmail] = useState("");
   const [notice, setNotice] = useState("");
   const [reanalyzing, setReanalyzing] = useState(false);
-  const [showPdfPreview, setShowPdfPreview] = useState(false);
+  const [showPdfPreview, setShowPdfPreview] = useState(() => new URLSearchParams(window.location.search).get("print-preview") === "1");
   const [shortPlanUrl, setShortPlanUrl] = useState(initialShortPlanUrl);
   const [shortLinkStatus, setShortLinkStatus] = useState(initialShortPlanUrl ? "ready" : "idle");
   const [shortLinkError, setShortLinkError] = useState("");
@@ -983,6 +1103,7 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
   const shareUrlRef = useRef(null);
   const shortLinkPromiseRef = useRef(null);
   const day = annotatedDay(plan.days[selectedDay] ?? plan.days[0] ?? { steps: [], stats: {} });
+  const queueById = useMemo(() => Object.fromEntries(ALL_ATTRACTIONS.map((attraction) => [attraction.id, queueForAttraction(attraction, queues)])), [queues]);
   const mapItems = planMapItems(day);
   const compactPlanUrl = useMemo(() => createPlanUrl(plan), [plan]);
   const planUrl = shortPlanUrl || compactPlanUrl;
@@ -1016,6 +1137,7 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
     planHeadingRef.current?.focus({ preventScroll: true });
   }, []);
   useEffect(() => writeStored(completedKey, completedIds), [completedIds, completedKey]);
+  useEffect(() => writeStored(rejectedKey, rejectedIds), [rejectedIds, rejectedKey]);
   useEffect(() => { if (notice) { const timeout = window.setTimeout(() => setNotice(""), 2400); return () => window.clearTimeout(timeout); } return undefined; }, [notice]);
   useEffect(() => setSelectedId(null), [selectedDay]);
   useEffect(() => {
@@ -1043,11 +1165,26 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
     setNotice(wasCompleted ? `Przywrócono: ${attraction?.name ?? "atrakcja"}` : `Zaliczone: ${attraction?.name ?? "atrakcja"}`);
   };
   const closeDetail = useCallback(() => setSelectedId(null), []);
+  const closeReplacement = useCallback(() => setReplacementRequest(null), []);
+  const handleReplace = (replacementId) => {
+    if (!replacementRequest) return;
+    const target = replacementTargetForPlan(plan, replacementRequest);
+    const nextRejectedIds = target ? [...new Set([...rejectedIds, target.attraction.id])] : rejectedIds;
+    try {
+      onReplaceAttraction(replacementRequest, replacementId, queueById);
+      setRejectedIds(nextRejectedIds);
+      if (target) setCompletedIds((current) => current.filter((id) => id !== target.attraction.id));
+      setReplacementRequest(null);
+      setNotice("Atrakcja wymieniona — godziny, obiad i bezpieczeństwo zostały zachowane");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Nie udało się bezpiecznie wymienić atrakcji");
+    }
+  };
   const handleReanalyze = async () => {
     if (reanalyzing) return;
     setReanalyzing(true);
     try {
-      await onReanalyze();
+      await onReanalyze(rejectedIds);
       setNotice("Plan przeliczony na świeżych kolejkach");
     } finally {
       setReanalyzing(false);
@@ -1147,7 +1284,7 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
           <p className="queue-snapshot">Kolejki: {queueSnapshot.label}{queueSnapshot.state === "stale" ? " — traktuj jako orientacyjne" : ""}.</p>
         </section>
 
-        <ShowSchedulePanel plan={plan} day={day} selectedDay={selectedDay} schedule={showSchedule} status={showStatus} onRefresh={onRefreshShows} onToggle={onToggleShows} />
+        <ShowSchedulePanel plan={plan} day={day} selectedDay={selectedDay} schedule={showSchedule} status={showStatus} onRefresh={() => onRefreshShows(rejectedIds)} onToggle={(includeShows) => onToggleShows(includeShows, rejectedIds)} />
 
         <section className="timeline-section" aria-labelledby="timeline-title">
           <div className="section-heading"><div><p className="eyebrow">PO KOLEI, BEZ CHAOSU</p><h2 id="timeline-title">Plan dnia</h2></div></div>
@@ -1160,9 +1297,9 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
                 const ride = ALL_ATTRACTIONS_BY_ID[step.attractionId];
                 const completed = completedIds.includes(ride.id);
                 const liveDistance = distanceCopy(position, ride);
-                return <article className={`timeline-ride ${completed ? "completed" : ""}`} key={step.id}><span className="timeline-time">{formatPlanTime(step.startMin)}</span><button className="ride-content" type="button" onClick={() => setSelectedId(ride.id)}><span className="route-number">{step.sequence}</span><span><em>WSZYSCY • {zoneLabel(ride.zone)}</em><h3>{ride.name}</h3><p>{attractionLabel(ride)}{Number.isFinite(step.queueMinutes) ? ` · kolejka ${step.queueMinutes} min` : ""}</p>{liveDistance && <small className="distance-meta" aria-label={`Odległość od was: ${liveDistance}`}><Footprints size={13} weight="duotone" /> <span>OD WAS</span> · {liveDistance}</small>}</span><CaretRight size={18} /></button><button className="complete-button" type="button" aria-pressed={completed} aria-label={`${completed ? "Cofnij zaliczenie" : "Oznacz jako zaliczoną"}: ${ride.name}`} onClick={() => toggleCompleted(ride.id)}><CheckCircle size={24} weight={completed ? "fill" : "regular"} /></button></article>;
+                return <article className={`timeline-ride ${completed ? "completed" : ""}`} key={step.id}><span className="timeline-time">{formatPlanTime(step.startMin)}</span><button className="ride-content" type="button" onClick={() => setSelectedId(ride.id)}><span className="route-number">{step.sequence}</span><span><em>WSZYSCY • {zoneLabel(ride.zone)}</em><h3>{ride.name}</h3><p>{attractionLabel(ride)}{Number.isFinite(step.queueMinutes) ? ` · kolejka ${step.queueMinutes} min` : ""}</p>{liveDistance && <small className="distance-meta" aria-label={`Odległość od was: ${liveDistance}`}><Footprints size={13} weight="duotone" /> <span>OD WAS</span> · {liveDistance}</small>}</span><CaretRight size={18} /></button><div className="ride-actions"><button className="replace-button" type="button" aria-label={`Wymień atrakcję: ${ride.name}`} title="Wymień tę atrakcję" onClick={() => setReplacementRequest({ dayIndex: selectedDay, stepId: step.id })}><ArrowClockwise size={19} weight="bold" /></button><button className="complete-button" type="button" aria-pressed={completed} aria-label={`${completed ? "Cofnij zaliczenie" : "Oznacz jako zaliczoną"}: ${ride.name}`} onClick={() => toggleCompleted(ride.id)}><CheckCircle size={23} weight={completed ? "fill" : "regular"} /></button></div></article>;
               }
-              return <article className="timeline-split" key={step.id}><span className="timeline-time">{formatPlanTime(step.startMin)}</span><div className="split-heading"><span className="route-number">{step.sequence}</span><div><em>PODZIAŁ GRUPY</em><h3>Dwie dobre trasy obok siebie</h3></div></div><div className="split-assignments">{step.assignments.map((assignment, index) => { const ride = ALL_ATTRACTIONS_BY_ID[assignment.attractionId]; const completed = completedIds.includes(ride.id); const liveDistance = distanceCopy(position, ride); return <div className={completed ? "completed" : ""} key={assignment.attractionId}><button className="split-detail" type="button" onClick={() => setSelectedId(ride.id)}><span>{step.sequence}{index === 0 ? "A" : "B"}</span><div><em>{assignment.label}</em><strong>{ride.name}</strong><small>{assignment.memberIds.map((id) => memberLabel(plan.profile.members.find((member) => member.id === id))).join(" · ")}</small>{liveDistance && <small className="distance-meta" aria-label={`Odległość od was: ${liveDistance}`}><Footprints size={13} weight="duotone" /> <span>OD WAS</span> · {liveDistance}</small>}</div><CaretRight size={17} /></button><button className="split-complete" type="button" aria-pressed={completed} aria-label={`${completed ? "Cofnij zaliczenie" : "Oznacz jako zaliczoną"}: ${ride.name}`} onClick={() => toggleCompleted(ride.id)}><CheckCircle size={22} weight={completed ? "fill" : "regular"} /></button></div>; })}</div><p className="reunion"><MapPin size={16} weight="fill" /><span><strong>{step.reunion.time}</strong> · {step.reunion.label}</span></p></article>;
+              return <article className="timeline-split" key={step.id}><span className="timeline-time">{formatPlanTime(step.startMin)}</span><div className="split-heading"><span className="route-number">{step.sequence}</span><div><em>PODZIAŁ GRUPY</em><h3>Dwie dobre trasy obok siebie</h3></div></div><div className="split-assignments">{step.assignments.map((assignment, index) => { const ride = ALL_ATTRACTIONS_BY_ID[assignment.attractionId]; const completed = completedIds.includes(ride.id); const liveDistance = distanceCopy(position, ride); return <div className={completed ? "completed" : ""} key={assignment.attractionId}><button className="split-detail" type="button" onClick={() => setSelectedId(ride.id)}><span>{step.sequence}{index === 0 ? "A" : "B"}</span><div><em>{assignment.label}</em><strong>{ride.name}</strong><small>{assignment.memberIds.map((id) => memberLabel(plan.profile.members.find((member) => member.id === id))).join(" · ")}</small>{liveDistance && <small className="distance-meta" aria-label={`Odległość od was: ${liveDistance}`}><Footprints size={13} weight="duotone" /> <span>OD WAS</span> · {liveDistance}</small>}</div><CaretRight size={17} /></button><div className="split-actions"><button className="split-replace" type="button" aria-label={`Wymień atrakcję: ${ride.name}`} title="Wymień tę atrakcję" onClick={() => setReplacementRequest({ dayIndex: selectedDay, stepId: step.id, assignmentIndex: index })}><ArrowClockwise size={18} weight="bold" /></button><button className="split-complete" type="button" aria-pressed={completed} aria-label={`${completed ? "Cofnij zaliczenie" : "Oznacz jako zaliczoną"}: ${ride.name}`} onClick={() => toggleCompleted(ride.id)}><CheckCircle size={21} weight={completed ? "fill" : "regular"} /></button></div></div>; })}</div><p className="reunion"><MapPin size={16} weight="fill" /><span><strong>{step.reunion.time}</strong> · {step.reunion.label}</span></p></article>;
             })}
           </div>
         </section>
@@ -1185,6 +1322,7 @@ function PlanView({ plan, initialShortPlanUrl = "", onEdit, onReanalyze, weather
       </main>
       {showPdfPreview && <PdfPreview plan={plan} planUrl={planUrl} onClose={() => setShowPdfPreview(false)} />}
       {selectedAttraction && <DetailSheet attraction={selectedAttraction} sequence={selectedAssignment.sequence} memberIds={selectedAssignment.memberIds} members={plan.profile.members} onClose={closeDetail} />}
+      {replacementRequest && <ReplacementSheet plan={plan} request={replacementRequest} queueById={queueById} rejectedIds={rejectedIds} onReplace={handleReplace} onClose={closeReplacement} />}
     </>
   );
 }
@@ -1331,10 +1469,12 @@ export function App() {
 
   const weatherAssessment = useMemo(() => weather ? assessThreeDayWeather(weather, { now: new Date(weatherClock), carWalkMinutes: 30 }) : null, [weather, weatherClock]);
   const queueMapFor = useCallback((queueData) => Object.fromEntries(Object.values(ALL_ATTRACTIONS_BY_ID).map((attraction) => [attraction.id, queueForAttraction(attraction, queueData)])), []);
-  const buildPlanForProfile = useCallback((profileInput, queueData, scheduleData = showScheduleRef.current) => {
+  const buildPlanForProfile = useCallback((profileInput, queueData, scheduleData = showScheduleRef.current, excludedIds = []) => {
     const normalizedProfile = normalizeDraftProfile(profileInput, DEFAULT_PROFILE);
     const safeProfile = normalizedProfile.members.filter(isGuardian).length < 2 ? { ...normalizedProfile, splitPolicy: "never" } : normalizedProfile;
-    const basePlan = buildUniversalPlan({ ...safeProfile, queueSnapshotAt: queueData?.updatedAt ?? null }, { queueById: queueMapFor(queueData) });
+    const excluded = new Set(excludedIds);
+    const availableAttractions = ALL_ATTRACTIONS.filter((attraction) => !excluded.has(attraction.id));
+    const basePlan = buildUniversalPlan({ ...safeProfile, queueSnapshotAt: queueData?.updatedAt ?? null }, { attractions: availableAttractions, queueById: queueMapFor(queueData) });
     return overlayShowsOnPlan(basePlan, scheduleData);
   }, [queueMapFor]);
 
@@ -1371,10 +1511,10 @@ export function App() {
     window.scrollTo({ top: 0, behavior: "auto" });
   };
 
-  const reanalyze = async () => {
+  const reanalyze = async (excludedIds = []) => {
     if (!plan) return;
     const latestQueues = await refreshQueues();
-    const nextPlan = buildPlanForProfile(plan.profile, latestQueues || queues);
+    const nextPlan = buildPlanForProfile(plan.profile, latestQueues || queues, showScheduleRef.current, excludedIds);
     if (countPlanAttractions(nextPlan) === 0) return;
     setPlan(nextPlan);
     writeStored(PLAN_KEY, nextPlan);
@@ -1382,10 +1522,10 @@ export function App() {
     window.scrollTo({ top: 0, behavior: "auto" });
   };
 
-  const refreshShowsAndReanalyze = useCallback(async () => {
+  const refreshShowsAndReanalyze = useCallback(async (excludedIds = []) => {
     const latestShows = await refreshShows();
     if (!plan) return latestShows;
-    const nextPlan = buildPlanForProfile(plan.profile, queues, latestShows || showScheduleRef.current);
+    const nextPlan = buildPlanForProfile(plan.profile, queues, latestShows || showScheduleRef.current, excludedIds);
     if (countPlanAttractions(nextPlan) === 0) return latestShows;
     setPlan(nextPlan);
     writeStored(PLAN_KEY, nextPlan);
@@ -1393,7 +1533,7 @@ export function App() {
     return latestShows;
   }, [buildPlanForProfile, plan, queues, refreshShows]);
 
-  const toggleShowsInPlan = useCallback((includeShows) => {
+  const toggleShowsInPlan = useCallback((includeShows, excludedIds = []) => {
     const sourceProfile = plan?.profile || profile;
     const nextProfile = normalizeDraftProfile({
       ...sourceProfile,
@@ -1401,12 +1541,21 @@ export function App() {
     }, DEFAULT_PROFILE);
     setProfile(nextProfile);
     if (!plan) return;
-    const nextPlan = buildPlanForProfile(nextProfile, queues, showScheduleRef.current);
+    const nextPlan = buildPlanForProfile(nextProfile, queues, showScheduleRef.current, excludedIds);
     if (countPlanAttractions(nextPlan) === 0) return;
     setPlan(nextPlan);
     writeStored(PLAN_KEY, nextPlan);
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
   }, [buildPlanForProfile, plan, profile, queues]);
+
+  const replaceAttraction = useCallback((request, replacementId, queueById) => {
+    if (!plan) return null;
+    const nextPlan = replacePlannedAttraction(plan, request, replacementId, { queueById });
+    setPlan(nextPlan);
+    writeStored(PLAN_KEY, nextPlan);
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    return nextPlan;
+  }, [plan]);
 
   const leaveSharedShortLink = () => {
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
@@ -1440,5 +1589,5 @@ export function App() {
 
   if (screen === "onboarding") return <Onboarding profile={profile} setProfile={setProfile} step={step} setStep={setStep} onGenerate={generate} queueStatus={queueStatus} queueUpdatedAt={queues?.updatedAt ?? null} onRefreshQueues={() => refreshQueues()} generationError={generationError} weatherAssessment={weatherAssessment} />;
   if (!plan) return null;
-  return <PlanView plan={plan} initialShortPlanUrl={shortHashPresent && !shortLinkDismissed ? createShortPlanUrl(shortPlanToken) : ""} onReanalyze={reanalyze} weatherAssessment={weatherAssessment} weatherStatus={weatherStatus} onRefreshWeather={refreshWeather} showSchedule={showSchedule} showStatus={showStatus} onRefreshShows={refreshShowsAndReanalyze} onToggleShows={toggleShowsInPlan} onEdit={() => { setGenerationError(""); setProfile(normalizeDraftProfile(plan.profile, DEFAULT_PROFILE)); setStep(0); setScreen("onboarding"); }} />;
+  return <PlanView plan={plan} queues={queues} initialShortPlanUrl={shortHashPresent && !shortLinkDismissed ? createShortPlanUrl(shortPlanToken) : ""} onReanalyze={reanalyze} onReplaceAttraction={replaceAttraction} weatherAssessment={weatherAssessment} weatherStatus={weatherStatus} onRefreshWeather={refreshWeather} showSchedule={showSchedule} showStatus={showStatus} onRefreshShows={refreshShowsAndReanalyze} onToggleShows={toggleShowsInPlan} onEdit={() => { setGenerationError(""); setProfile(normalizeDraftProfile(plan.profile, DEFAULT_PROFILE)); setStep(0); setScreen("onboarding"); }} />;
 }
