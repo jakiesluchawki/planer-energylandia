@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { buildUniversalPlan } from "../src/planner.js";
 import {
   createEmailDraftUrl,
+  createShortPlanUrl,
   createShortPlanLink,
   decodePlan,
   encodeCompactPlan,
@@ -368,6 +369,14 @@ test("krótki link zapisuje wyłącznie compact v2 i ma klikalny hash bez znaku 
   assert.equal(JSON.parse(Buffer.from(body.payload, "base64url").toString("utf8")).v, 2);
   assert.equal(shortPlanTokenFromHash(new URL(url).hash), token);
   assert.equal(hasShortPlanHash(new URL(url).hash), true);
+});
+
+test("wersjonowany krótki link omija stary cache HTML bez wydłużania payloadu", () => {
+  const token = "AbCdEfGhIjKlMn_o";
+  const url = createShortPlanUrl(token, "https://example.com/planer/#plan=stary", "abcdef123456");
+  assert.equal(url, `https://example.com/planer/?rabcdef123456#p/${token}`);
+  assert.equal(url.includes("="), false);
+  assert.equal(shortPlanTokenFromHash(new URL(url).hash), token);
 });
 
 test("krótki link pobiera plan z API i nadal przechodzi pełną walidację bezpieczeństwa", async () => {

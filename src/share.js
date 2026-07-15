@@ -1,5 +1,6 @@
 import { ALL_ATTRACTIONS_BY_ID, RESTAURANTS } from "./extendedData.js";
 import { formatPlanTime, timeToMinutes, validatePlanSafety } from "./planner.js";
+import { APP_RELEASE, withReleaseQuery } from "./appUpdate.js";
 
 const MAX_MEMBERS = 14;
 // Jeden dobrowolny pokaz może wejść do trasy, ale nie powinien zjadać miejsca
@@ -959,8 +960,8 @@ function currentHref(fallback = "https://example.invalid/") {
   return typeof window !== "undefined" && window.location?.href ? window.location.href : fallback;
 }
 
-export function createPlanUrl(plan, href = currentHref()) {
-  const url = new URL(href);
+export function createPlanUrl(plan, href = currentHref(), release = APP_RELEASE) {
+  const url = new URL(withReleaseQuery(href, release));
   const payload = encodePlan(plan);
   url.hash = payload ? `plan=${payload}` : "";
   return url.toString();
@@ -1066,9 +1067,9 @@ export function hasShortPlanHash(hash = typeof window !== "undefined" ? window.l
   return /^#p(?:\/|$)/.test(String(hash));
 }
 
-export function createShortPlanUrl(token, href = currentHref()) {
+export function createShortPlanUrl(token, href = currentHref(), release = APP_RELEASE) {
   if (!SHORT_PLAN_TOKEN_PATTERN.test(String(token || ""))) return "";
-  const url = new URL(href);
+  const url = new URL(withReleaseQuery(href, release));
   url.hash = `p/${token}`;
   return url.toString();
 }
