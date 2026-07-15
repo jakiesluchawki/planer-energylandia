@@ -1,6 +1,7 @@
 {
   "name": "PogodaPark — pogoda i plan Energylandii",
   "short_name": "PogodaPark",
+  "id": "./",
   "description": "Ocena pogody, alert opadowy i spersonalizowana trasa po Energylandii.",
   "start_url": "./",
   "display": "standalone",
