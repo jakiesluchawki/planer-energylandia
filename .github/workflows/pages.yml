@@ -20,9 +20,16 @@ concurrency:
 
 jobs:
   test-and-build:
+    # GitHub potrafi jeszcze dostarczyć opóźnione zdarzenia starego crona.
+    # Nie uruchamiaj dla nich całego wdrożenia.
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6-20 * * *' }}
+    # Planowe odświeżenie jest best-effort: działająca poprzednia wersja jest
+    # bezpieczniejsza niż alarmowy mail przy chwilowym 503 GitHub Pages.
+    # Push i ręczne uruchomienie nadal kończą się błędem, jeśli deploy zawiedzie.
+    continue-on-error: ${{ github.event_name == 'schedule' }}
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url || steps.deployment_final.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -70,4 +77,28 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
         uses: actions/deploy-pages@v4
+
+      - name: Wait before retrying Pages
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        run: sleep 15
+
+      - name: Retry GitHub Pages deployment
+        id: deployment_retry
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      - name: Wait before final Pages attempt
+        if: ${{ steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome == 'failure' }}
+        run: sleep 45
+
+      - name: Final GitHub Pages deployment attempt
+        id: deployment_final
+        if: ${{ steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome == 'failure' }}
+        uses: actions/deploy-pages@v4
+
+      - name: Record deferred scheduled deployment
+        if: ${{ always() && github.event_name == 'schedule' && steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome == 'failure' && steps.deployment_final.outcome == 'failure' }}
+        run: echo "::warning::GitHub Pages nie przyjął planowego wdrożenia po trzech próbach. Poprzednia publiczna wersja pozostaje aktywna; następne odświeżenie spróbuje ponownie."
